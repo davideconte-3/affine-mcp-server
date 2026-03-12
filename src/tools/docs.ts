@@ -1272,6 +1272,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     flavour: string;
     blockType?: string;
     extraBlocks?: Array<{ blockId: string; block: Y.Map<any> }>;
+    afterInsert?: (block: Y.Map<any>) => void;
   } {
     const blockId = generateId();
     const block = new Y.Map<any>();
@@ -1397,14 +1398,31 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
           block.set(`prop:columns.${columnId}.order`, colData.order);
           if (colData.width !== undefined) block.set(`prop:columns.${columnId}.width`, colData.width);
         }
-        for (const [cellKey, cellData] of Object.entries(cells)) {
-          // Store as plain string — Y.Text pre-populated outside a Y.Doc loses content
-          // on encode/decode. Plain strings are supported by AFFiNE frontend for cell text.
-          block.set(`prop:cells.${cellKey}.text`, cellData.text);
-        }
         block.set("prop:comments", undefined);
         block.set("prop:textAlign", undefined);
-        return { blockId, block, flavour: "affine:table" };
+        // Cells need Y.Text. We defer cell population via afterInsert so Y.Text is
+        // created AFTER the block is part of the Y.Doc (avoids state-vector loss).
+        const cellSnapshot = { ...cells };
+        const rowIdsSnapshot = [...rowIds];
+        return {
+          blockId,
+          block,
+          flavour: "affine:table",
+          afterInsert: (b: Y.Map<any>) => {
+            for (const [cellKey, cellData] of Object.entries(cellSnapshot)) {
+              const cellYText = new Y.Text();
+              // IMPORTANT: insert into Y.Map FIRST so Y.Text is part of the Y.Doc,
+              // THEN insert text content — otherwise insert() is a no-op (standalone Y.Text)
+              b.set(`prop:cells.${cellKey}.text`, cellYText);
+              const rowIndex = rowIdsSnapshot.indexOf(cellKey.split(":")[0]);
+              if (rowIndex === 0 && cellData.text) {
+                cellYText.insert(0, cellData.text, { bold: true } as Record<string, unknown>);
+              } else if (cellData.text) {
+                cellYText.insert(0, cellData.text);
+              }
+            }
+          },
+        };
       }
       case "bookmark": {
         setSysFields(block, blockId, "affine:bookmark");
@@ -1711,9 +1729,10 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const prevSV = Y.encodeStateVector(doc);
       const blocks = doc.getMap("blocks") as Y.Map<any>;
       const context = resolveInsertContext(blocks, normalized);
-      const { blockId, block, flavour, blockType, extraBlocks } = createBlock(normalized);
+      const { blockId, block, flavour, blockType, extraBlocks, afterInsert } = createBlock(normalized);
 
       blocks.set(blockId, block);
+      if (afterInsert) afterInsert(block);
       if (Array.isArray(extraBlocks)) {
         for (const extra of extraBlocks) {
           blocks.set(extra.blockId, extra.block);
@@ -2155,8 +2174,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         try {
           const normalized = normalizeAppendBlockInput(appendInput);
           const context = resolveInsertContext(blocks, normalized);
-          const { blockId, block, extraBlocks } = createBlock(normalized);
+          const { blockId, block, extraBlocks, afterInsert } = createBlock(normalized);
           blocks.set(blockId, block);
+          if (afterInsert) afterInsert(block);
           if (Array.isArray(extraBlocks)) {
             for (const extra of extraBlocks) {
               blocks.set(extra.blockId, extra.block);
