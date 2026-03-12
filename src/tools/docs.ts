@@ -2692,7 +2692,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     getDocHandler as any
   );
 
-  const readDocHandler = async (parsed: { workspaceId?: string; docId: string }) => {
+  const readDocHandler = async (parsed: { workspaceId?: string; docId: string; includeMarkdown?: boolean }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
       throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
@@ -2797,7 +2797,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         }
       }
 
-      return text({
+      const result: Record<string, unknown> = {
         docId: parsed.docId,
         title: title || null,
         tags,
@@ -2805,7 +2805,13 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         blockCount: blockRows.length,
         blocks: blockRows,
         plainText: plainTextLines.join("\n"),
-      });
+      };
+      if (parsed.includeMarkdown) {
+        const collected = collectDocForMarkdown(doc, new Map());
+        const rendered = renderBlocksToMarkdown({ rootBlockIds: collected.rootBlockIds, blocksById: collected.blocksById });
+        result.markdown = rendered.markdown;
+      }
+      return text(result);
     } finally {
       socket.disconnect();
     }
@@ -2814,10 +2820,11 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     "read_doc",
     {
       title: "Read Document Content",
-      description: "Read document block content via WebSocket snapshot (blocks + plain text).",
+      description: "Read document block content via WebSocket snapshot (blocks + plain text). Set includeMarkdown=true to also get a rendered markdown version.",
       inputSchema: {
         workspaceId: WorkspaceId.optional(),
         docId: DocId,
+        includeMarkdown: z.boolean().optional().describe("If true, also return the doc content as markdown (default: false)."),
       },
     },
     readDocHandler as any
@@ -3716,6 +3723,66 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       parentDocId: z.string().optional().describe("Parent doc to link the new doc under in the sidebar."),
     },
   }, createDocFromTemplateHandler as any);
+
+  // ─── move_doc ───────────────────────────────────────────────────────────────
+  // move a doc in the sidebar by removing its embed_linked_doc from the old parent
+  // and adding it to the new parent. fromParentDocId is optional — if omitted, only adds to new parent.
+  const moveDocHandler = async (parsed: { workspaceId?: string; docId: string; toParentDocId: string; fromParentDocId?: string }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+    const { endpoint, cookie, bearer } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie, bearer);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      let removedFromParent = false;
+      if (parsed.fromParentDocId) {
+        const parentDoc = new Y.Doc();
+        const parentSnapshot = await loadDoc(socket, workspaceId, parsed.fromParentDocId);
+        if (parentSnapshot.missing) {
+          Y.applyUpdate(parentDoc, Buffer.from(parentSnapshot.missing, "base64"));
+          const prevSV = Y.encodeStateVector(parentDoc);
+          const blocks = parentDoc.getMap("blocks") as Y.Map<any>;
+          let embedBlockId: string | null = null;
+          let embedParentChildren: Y.Array<any> | null = null;
+          let embedIndex = -1;
+          for (const [id, raw] of blocks) {
+            if (!(raw instanceof Y.Map)) continue;
+            if (raw.get("sys:flavour") === "affine:embed-linked-doc" && raw.get("prop:pageId") === parsed.docId) {
+              embedBlockId = String(id); break;
+            }
+          }
+          if (embedBlockId) {
+            for (const [, raw] of blocks) {
+              if (!(raw instanceof Y.Map)) continue;
+              const children = raw.get("sys:children");
+              if (!(children instanceof Y.Array)) continue;
+              const arr = children.toArray() as string[];
+              const idx = arr.indexOf(embedBlockId);
+              if (idx >= 0) { embedParentChildren = children; embedIndex = idx; break; }
+            }
+            if (embedParentChildren && embedIndex >= 0) embedParentChildren.delete(embedIndex, 1);
+            blocks.delete(embedBlockId);
+            const delta = Y.encodeStateAsUpdate(parentDoc, prevSV);
+            await pushDocUpdate(socket, workspaceId, parsed.fromParentDocId, Buffer.from(delta).toString("base64"));
+            removedFromParent = true;
+          }
+        }
+      }
+      await appendBlockInternal({ workspaceId, docId: parsed.toParentDocId, type: "embed_linked_doc", pageId: parsed.docId });
+      return text({ moved: true, docId: parsed.docId, toParentDocId: parsed.toParentDocId, removedFromParent });
+    } finally { socket.disconnect(); }
+  };
+  server.registerTool("move_doc", {
+    title: "Move Document in Sidebar",
+    description: "Move a doc in the sidebar by embedding it under a new parent. fromParentDocId optionally removes it from the old parent.",
+    inputSchema: {
+      workspaceId: z.string().optional(),
+      docId: z.string().describe("The doc to move."),
+      toParentDocId: z.string().describe("The new parent doc."),
+      fromParentDocId: z.string().optional().describe("Current parent to remove the embed from (optional)."),
+    },
+  }, moveDocHandler as any);
 
   const appendMarkdownHandler = async (parsed: {
     workspaceId?: string;
